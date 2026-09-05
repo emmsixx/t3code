@@ -30,7 +30,7 @@ import {
   CheckpointWorkspacePathMissingError,
 } from "./Errors.ts";
 import type { CheckpointServiceError } from "./Errors.ts";
-import { checkpointRefForThreadTurn } from "./Utils.ts";
+import { checkpointStartRef, checkpointRefForThreadTurn } from "./Utils.ts";
 import * as CheckpointStore from "./CheckpointStore.ts";
 
 /** Service tag for checkpoint diff queries. */
@@ -164,10 +164,16 @@ export const make = Effect.gen(function* () {
         });
       }
 
+      const startRef = checkpointStartRef(toCheckpointRef);
+      const turnBaselineRef =
+        input.toTurnCount === input.fromTurnCount + 1 &&
+        (yield* checkpointStore.hasCheckpointRef({ cwd: workspaceCwd, checkpointRef: startRef }))
+          ? startRef
+          : fromCheckpointRef;
       const diff = yield* checkpointStore
         .diffCheckpoints({
           cwd: workspaceCwd,
-          fromCheckpointRef,
+          fromCheckpointRef: turnBaselineRef,
           toCheckpointRef,
           fallbackFromToHead: false,
           ignoreWhitespace,

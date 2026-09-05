@@ -60,7 +60,7 @@ import {
   ProviderService,
   type ProviderServiceShape,
 } from "../../provider/Services/ProviderService.ts";
-import { checkpointRefForThreadTurn } from "../../checkpointing/Utils.ts";
+import { checkpointRefForThreadTurn, checkpointStartRef } from "../../checkpointing/Utils.ts";
 import { ProviderValidationError } from "../../provider/Errors.ts";
 import { ServerConfig } from "../../config.ts";
 import * as WorkspaceEntries from "../../workspace/WorkspaceEntries.ts";
@@ -496,6 +496,81 @@ describe("CheckpointReactor", () => {
     };
   }
 
+  it("excludes changes between turns without rewriting completed checkpoints", async () => {
+    const harness = await createHarness({ seedFilesystemCheckpoints: false });
+    const threadId = ThreadId.make("thread-1");
+    const run = async (ordinal: number, edit?: () => void) => {
+      harness.provider.emit({
+        type: "turn.started",
+        eventId: EventId.make(`start-${ordinal}`),
+        provider: ProviderDriverKind.make("codex"),
+        threadId,
+        turnId: asTurnId(`turn-${ordinal}`),
+        createdAt: "2026-01-01T00:00:00.000Z",
+      });
+      await harness.drain();
+      edit?.();
+      harness.provider.emit({
+        type: "turn.started",
+        eventId: EventId.make(`duplicate-start-${ordinal}`),
+        provider: ProviderDriverKind.make("codex"),
+        threadId,
+        turnId: asTurnId(`turn-${ordinal}`),
+        createdAt: "2026-01-01T00:00:00.000Z",
+      });
+      await harness.drain();
+      harness.provider.emit({
+        type: "turn.completed",
+        eventId: EventId.make(`complete-${ordinal}`),
+        provider: ProviderDriverKind.make("codex"),
+        threadId,
+        turnId: asTurnId(`turn-${ordinal}`),
+        createdAt: "2026-01-01T00:00:01.000Z",
+        payload: { state: "completed" },
+      });
+      await harness.drain();
+      return (await harness.readModel()).threads
+        .find((thread) => thread.id === threadId)
+        ?.checkpoints.find((checkpoint) => checkpoint.turnId === `turn-${ordinal}`);
+    };
+    expect((await run(1))?.files).toEqual([]);
+    NodeFS.writeFileSync(NodePath.join(harness.cwd, "README.md"), "upstream\n");
+    NodeChildProcess.execFileSync("git", ["commit", "-am", "external update"], {
+      cwd: harness.cwd,
+    });
+    expect((await run(2))?.files).toEqual([]);
+    expect(
+      gitShowFileAtRef(harness.cwd, checkpointRefForThreadTurn(threadId, 1), "README.md"),
+    ).toBe("v1\n");
+    NodeFS.writeFileSync(NodePath.join(harness.cwd, "outside.txt"), "external edit\n");
+    expect(
+      (
+        await run(3, () => {
+          NodeFS.writeFileSync(NodePath.join(harness.cwd, "README.md"), "agent edit\n");
+        })
+      )?.files,
+    ).toEqual([{ path: "README.md", kind: "modified", additions: 1, deletions: 1 }]);
+    expect(
+      gitShowFileAtRef(harness.cwd, checkpointRefForThreadTurn(threadId, 2), "README.md"),
+    ).toBe("upstream\n");
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.checkpoint.revert",
+        commandId: CommandId.make("revert-idle-edits"),
+        threadId,
+        turnCount: 2,
+        createdAt: "2026-01-01T00:00:02.000Z",
+      }),
+    );
+    await harness.drain();
+    expect(NodeFS.readFileSync(NodePath.join(harness.cwd, "README.md"), "utf8")).toBe("upstream\n");
+    expect(
+      gitRefExists(harness.cwd, checkpointStartRef(checkpointRefForThreadTurn(threadId, 3))),
+    ).toBe(false);
+    NodeFS.writeFileSync(NodePath.join(harness.cwd, "README.md"), "new external state\n");
+    expect((await run(3))?.files).toEqual([]);
+  });
+
   effectIt.effect("captures baseline and large turn summaries before completion receipts", () =>
     Effect.gen(function* () {
       const harness = yield* Effect.promise(() =>
@@ -789,6 +864,10 @@ describe("CheckpointReactor", () => {
           createdAt,
           threadId,
           turnId: followUpTurnId,
+        });
+        expect(yield* harness.nextReceipt).toMatchObject({
+          type: "checkpoint.baseline.captured",
+          checkpointTurnCount: 1,
         });
         harness.provider.emit({
           type: "turn.completed",
@@ -1287,6 +1366,10 @@ describe("CheckpointReactor", () => {
       );
 
       emit("turn.started", 3);
+      expect(yield* harness.nextReceipt).toMatchObject({
+        type: "checkpoint.baseline.captured",
+        checkpointTurnCount: 1,
+      });
       yield* Effect.promise(harness.drain);
       NodeFS.writeFileSync(NodePath.join(harness.cwd, "README.md"), "next turn\n");
       emit("turn.completed", 3);

@@ -9,6 +9,11 @@ export function checkpointRefForThreadTurn(threadId: ThreadId, turnCount: number
   );
 }
 
+/** A separate starting snapshot keeps turn diffs independent of edits made while idle. */
+export function checkpointStartRef(checkpointRef: CheckpointRef): CheckpointRef {
+  return CheckpointRef.make(`${checkpointRef}-start`);
+}
+
 export function resolveThreadWorkspaceCwd(input: {
   readonly thread: {
     readonly projectId: ProjectId;
